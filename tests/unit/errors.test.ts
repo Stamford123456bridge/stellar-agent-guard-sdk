@@ -154,8 +154,14 @@ const ERROR_CASES: Array<[string, () => Error]> = [
         cause: new Error("root"),
       }),
   ],
-  ["RateLimitedError", () => new RateLimitedError({ stage: "simulate", retryAfterMs: 1000, attempts: 2 })],
-  ["SigningError", () => new SigningError("sign failed", { address: "GABC", cause: new Error("root") })],
+  [
+    "RateLimitedError",
+    () => new RateLimitedError({ stage: "simulate", retryAfterMs: 1000, attempts: 2 }),
+  ],
+  [
+    "SigningError",
+    () => new SigningError("sign failed", { address: "GABC", cause: new Error("root") }),
+  ],
   [
     "BroadcastError",
     () =>
@@ -188,9 +194,14 @@ const ERROR_CASES: Array<[string, () => Error]> = [
   [
     "PolicyEncodeError",
     () =>
-      new PolicyEncodeError([{ path: "per_tx_cap", rule: "invalid_type", message: "expected integer" }]),
+      new PolicyEncodeError([
+        { path: "per_tx_cap", rule: "invalid_type", message: "expected integer" },
+      ]),
   ],
-  ["PolicyFileReadError", () => new PolicyFileReadError("read failed", { path: "/tmp/p.json", code: "ENOENT" })],
+  [
+    "PolicyFileReadError",
+    () => new PolicyFileReadError("read failed", { path: "/tmp/p.json", code: "ENOENT" }),
+  ],
   [
     "PolicyValidationError",
     () =>
@@ -199,7 +210,10 @@ const ERROR_CASES: Array<[string, () => Error]> = [
         failures: [{ path: "window_cap", rule: "window_requires_secs", message: "needs window" }],
       }),
   ],
-  ["AdapterMappingError", () => new AdapterMappingError("mapping failed", { field: "toContractCall" })],
+  [
+    "AdapterMappingError",
+    () => new AdapterMappingError("mapping failed", { field: "toContractCall" }),
+  ],
   [
     "AdapterConfigError",
     () =>
@@ -210,13 +224,19 @@ const ERROR_CASES: Array<[string, () => Error]> = [
       }),
   ],
   ["GuardBlockedError", () => new GuardBlockedError({ reason: "paused", stage: "preflight" })],
-  ["HeartbeatBlockedError", () => new HeartbeatBlockedError({ reason: "paused", detail: "detail" })],
+  [
+    "HeartbeatBlockedError",
+    () => new HeartbeatBlockedError({ reason: "paused", detail: "detail" }),
+  ],
   [
     "HeartbeatDryRunError",
     () => new HeartbeatDryRunError({ verdict: "blocked", reason: "paused", detail: null }),
   ],
   ["HeartbeatIntervalError", () => new HeartbeatIntervalError(10, 10n, 2000)],
-  ["RpcTimeoutError", () => new RpcTimeoutError({ stage: "pre-flight", aborted: false, timeoutMs: 1000 })],
+  [
+    "RpcTimeoutError",
+    () => new RpcTimeoutError({ stage: "pre-flight", aborted: false, timeoutMs: 1000 }),
+  ],
   [
     "InvokeRetryError",
     () =>
@@ -325,16 +345,19 @@ describe("guard error JSON serialization (#477)", () => {
       JSON.stringify(new GuardUndeterminedError("could not classify", { cause })),
     ) as { cause: Record<string, unknown> };
 
-    assert.deepEqual(json.cause, { name: "Error", message: "connection reset", code: "ECONNRESET" });
+    assert.deepEqual(json.cause, {
+      name: "Error",
+      message: "connection reset",
+      code: "ECONNRESET",
+    });
     assert.equal("stack" in json.cause, false);
     assert.equal(
       JSON.stringify(new GuardUndeterminedError("x", { cause: { request: "secret" } })),
       JSON.stringify(new GuardUndeterminedError("x", { cause: { request: "secret" } })),
     );
     assert.deepEqual(
-      JSON.parse(
-        JSON.stringify(new GuardUndeterminedError("x", { cause: { request: "secret" } })),
-      ).cause,
+      JSON.parse(JSON.stringify(new GuardUndeterminedError("x", { cause: { request: "secret" } })))
+        .cause,
       { type: "Object" },
     );
   });
@@ -355,7 +378,9 @@ describe("guard error JSON serialization (#477)", () => {
     ]);
 
     const encode = JSON.parse(
-      JSON.stringify(new PolicyEncodeError([{ path: "assets[0]", rule: "invalid_address", message: "bad" }])),
+      JSON.stringify(
+        new PolicyEncodeError([{ path: "assets[0]", rule: "invalid_address", message: "bad" }]),
+      ),
     ) as Record<string, unknown>;
     assert.equal(encode["path"], "assets[0]");
     assert.equal(encode["rule"], "invalid_address");

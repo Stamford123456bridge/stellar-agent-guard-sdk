@@ -2894,7 +2894,8 @@ describe("onVerdict observer (#408)", () => {
     const interceptor = observedInterceptor(createMockServer(), events);
 
     await assert.rejects(
-      async () => interceptor.check({ contract: unsafeContractAddress(""), fn: "transfer", args: [] }),
+      async () =>
+        interceptor.check({ contract: unsafeContractAddress(""), fn: "transfer", args: [] }),
       InvalidInputError,
     );
     assert.equal(events.length, 0);
