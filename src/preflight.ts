@@ -164,8 +164,25 @@ export function validateContractCall(call: ContractCall): void {
 export const PreFlightUndeterminedError = GuardUndeterminedError;
 export type PreFlightUndeterminedError = GuardUndeterminedError;
 
+/**
+ * Provenance present only on a verdict served from the optional verdict cache.
+ *
+ * Fields are absent on a fresh simulation, so an existing consumer sees exactly
+ * the shape it saw before the fields existed. They are also never part of the
+ * cache key and never participate in equality: a hit and a freshly computed
+ * verdict describe the same decision.
+ */
+export interface PreFlightCacheProvenance {
+  /** True when the verdict was reused from the cache instead of re-simulated. */
+  cached?: boolean;
+  /** Ledger the cached verdict was computed against. */
+  observedLedger?: number;
+  /** Age of the cached verdict, in milliseconds, when it was returned. */
+  ageMs?: number;
+}
+
 export type PreFlightDecision =
-  | {
+  | ({
       allowed: true;
       kind: "admissible";
       /** The network's own resource fee estimate for this call, in stroops. */
@@ -181,8 +198,8 @@ export type PreFlightDecision =
        * Omitted when the RPC response did not establish a usable ledger.
        */
       provenance?: CostProvenance;
-    }
-  | {
+    } & PreFlightCacheProvenance)
+  | ({
       allowed: false;
       kind: "blocked";
       /** The contract's reason symbol, e.g. `per_tx_cap_exceeded`. */
@@ -191,8 +208,8 @@ export type PreFlightDecision =
       explanation: string;
       detail: string;
       diagnosticEvents: unknown[];
-    }
-  | {
+    } & PreFlightCacheProvenance)
+  | ({
       allowed: false;
       kind: "undetermined";
       detail: string;
@@ -204,7 +221,7 @@ export type PreFlightDecision =
        * HTTP 429 (see `maxConcurrentSimulations`). Absent otherwise.
        */
       cause?: PreFlightUndeterminedCause;
-    };
+    } & PreFlightCacheProvenance);
 
 /** Causes an `undetermined` pre-flight verdict can carry (additive). */
 export type PreFlightUndeterminedCause = "rate_limited";
@@ -375,6 +392,17 @@ export type PolicyRevision = string | number | bigint | boolean | null | undefin
 export interface PreFlightCheckOptions {
   onStep?: (step: InvokeStepEvent) => void;
   /**
+   * Bypass the verdict cache for this call only: run a new simulation and never
+   * reuse a cached verdict, and share no coalesced run either. The cache is
+   * left untouched (nothing is read and nothing is stored), so later checks
+   * behave exactly as they did before.
+   *
+   * Use it before a high-value transfer when the cached verdict's age or ledger
+   * (`cached`/`observedLedger`/`ageMs`) is older than the caller is willing to
+   * accept.
+   */
+  forceFresh?: boolean;
+  /**
    * Caller-owned cancellation; aborts the RPC calls the check makes. A fired
    * signal yields an `undetermined` verdict, never a throw.
    */
@@ -501,11 +529,47 @@ export interface PreFlightConfig {
     maxBackoffMs?: number;
   };
   /**
+   * Observability-only callback, invoked exactly once for every verdict
+   * `check()` returns — including a cache hit, a coalesced result and a
+   * fail-closed timeout verdict.
+   *
+   * It receives the final decision's kind, the contract reason (blocked only),
+   * whether the verdict came from the cache, how long it took, the ledger when
+   * known, and the call's function and contract. Arguments are never included.
+   *
+   * The hook cannot change a verdict: a throw (or a rejected promise from an
+   * async hook) is caught and logged, and the caller still receives the
+   * original verdict and fee data. It is not invoked when input validation
+   * throws, because no verdict was produced.
+   */
+  onVerdict?: (event: PreFlightVerdictEvent) => void;
+  /**
    * Inject a custom clock for time-dependent operations (cache TTL, batch
    * deadlines, etc.). Defaults to the system clock; use a FakeClock in tests
    * for deterministic timing.
    */
   clock?: Clock;
+}
+
+/**
+ * The payload of the `onVerdict` observer hook.
+ *
+ * Deliberately a summary, not a verdict copy: it is safe to ship to metrics and
+ * logs, and it never carries call arguments, diagnostic events or XDR.
+ */
+export interface PreFlightVerdictEvent {
+  /** The verdict that was returned. */
+  kind: PreFlightDecision["kind"];
+  /** The contract's refusal reason; present only for `blocked`. */
+  reason?: string;
+  /** True when the verdict was served from the cache. */
+  cached: boolean;
+  /** Wall-clock time spent producing the verdict, in milliseconds. */
+  durationMs: number;
+  /** Ledger the verdict was evaluated against, when known. */
+  ledger?: number;
+  /** The call's identity: function and contract only, never its arguments. */
+  call: { fn: string; contract: string };
 }
 
 /** Default for `maxConcurrentSimulations`. */
@@ -558,6 +622,7 @@ const MAX_CACHE_TTL_MS = LEDGER_CLOSE_MS;
 interface CacheEntry {
   decision: PreFlightDecision;
   ledger: number;
+  storedAt: number;
   expiresAt: number;
 }
 
@@ -851,12 +916,42 @@ export class PreFlightInterceptor {
    * work against its own bound instead.
    */
   async check(call: ContractCall, options?: PreFlightCheckOptions): Promise<PreFlightDecision> {
+    // Input validation throws before a verdict exists, so it never reaches the
+    // observer: `onVerdict` reports decisions, not caller mistakes.
     validateContractCall(call);
+    const startedAt = this.clock.now();
+    const result = await this.decide(call, options);
+    this.emitVerdict(call, result.decision, startedAt, result.cached, result.ledger);
+    return result.decision;
+  }
+
+  /**
+   * The decision path behind `check()`, returning the verdict together with its
+   * cache provenance so `check()` can notify the observer exactly once.
+   */
+  private async decide(
+    call: ContractCall,
+    options?: PreFlightCheckOptions,
+  ): Promise<{ decision: PreFlightDecision; cached: boolean; ledger: number | undefined }> {
+    // `forceFresh` bypasses the cache entirely — no lookup, no store, and no
+    // coalesced run — so the caller gets a new simulation and the cache is
+    // left exactly as it was.
+    if (options?.forceFresh) {
+      const decision = await this.computeDecision(call, null, options.onStep, {
+        signal: options.signal,
+        timeoutMs: options.timeoutMs,
+      });
+      return { decision, cached: false, ledger: undefined };
+    }
 
     // An already-aborted caller asks for no work at all, including the cache
     // lookup's ledger read. Answer before any RPC or in-flight registration.
     if (options?.signal?.aborted) {
-      return timeoutDecision(new RpcTimeoutError({ stage: "pre-flight", aborted: true }));
+      return {
+        decision: timeoutDecision(new RpcTimeoutError({ stage: "pre-flight", aborted: true })),
+        cached: false,
+        ledger: undefined,
+      };
     }
 
     const lookup = await this.cacheContext(call, {
@@ -868,13 +963,17 @@ export class PreFlightInterceptor {
       // The check fails closed: a stalled RPC must never leave a guardrail
       // call pending indefinitely, and the uncached path would need a budget
       // the caller has not granted.
-      return timeoutDecision(lookup.error);
+      return { decision: timeoutDecision(lookup.error), cached: false, ledger: undefined };
     }
     if (lookup.kind === "unavailable" && options?.signal?.aborted) {
       // The cache could not be consulted and the caller has already given up:
       // the uncached path is no longer within the caller's bound, so the check
       // fails closed instead of starting work nobody is waiting for.
-      return timeoutDecision(new RpcTimeoutError({ stage: "pre-flight", aborted: true }));
+      return {
+        decision: timeoutDecision(new RpcTimeoutError({ stage: "pre-flight", aborted: true })),
+        cached: false,
+        ledger: undefined,
+      };
     }
     const context = lookup.kind === "context" ? lookup.context : null;
     if (context) {
@@ -894,7 +993,19 @@ export class PreFlightInterceptor {
             ledger: context.ledger,
           });
           this._hits++;
-          return cached.decision;
+          // Provenance is added to the returned copy only: the stored verdict
+          // stays timeless, so a later hit reports its own age rather than the
+          // age of the first hit.
+          return {
+            decision: {
+              ...cached.decision,
+              cached: true,
+              observedLedger: cached.ledger,
+              ageMs: Math.max(0, now - cached.storedAt),
+            } as PreFlightDecision,
+            cached: true,
+            ledger: context.ledger,
+          };
         }
         this.cache.delete(context.key);
       }
@@ -906,10 +1017,11 @@ export class PreFlightInterceptor {
     // one is not coalesced: sharing a run would either drop that observer's
     // events or interleave two observers over one pipeline.
     if (options?.onStep || !this.coalesceInFlight) {
-      return this.computeDecision(call, context, options?.onStep, {
+      const decision = await this.computeDecision(call, context, options?.onStep, {
         signal: options?.signal,
         timeoutMs: options?.timeoutMs,
       });
+      return { decision, cached: false, ledger: context?.ledger };
     }
 
     // The map is per interceptor, so the call fingerprint plus this instance's
@@ -931,7 +1043,50 @@ export class PreFlightInterceptor {
       // outcome — admitted, refused or undetermined — survives the run.
       shared.then(settle, settle);
     }
-    return this.awaitWithCallerBound(shared, options);
+    const decision = await this.awaitWithCallerBound(shared, options);
+    return { decision, cached: false, ledger: context?.ledger };
+  }
+
+  /**
+   * Notify the observability hook once, after the verdict is final.
+   *
+   * Observability must never influence enforcement: a throwing hook, or an
+   * async hook that rejects, is caught and logged and the caller still receives
+   * the original verdict and fee data.
+   */
+  private emitVerdict(
+    call: ContractCall,
+    decision: PreFlightDecision,
+    startedAt: number,
+    cached: boolean,
+    ledger: number | undefined,
+  ): void {
+    const hook = this.config.onVerdict;
+    if (!hook) return;
+    const event: PreFlightVerdictEvent = {
+      kind: decision.kind,
+      cached,
+      durationMs: Math.max(0, this.clock.now() - startedAt),
+      call: { fn: call.fn, contract: call.contract },
+      ...(decision.kind === "blocked" ? { reason: decision.reason } : {}),
+      ...(ledger !== undefined ? { ledger } : {}),
+    };
+    try {
+      const returned = hook(event) as unknown;
+      if (returned && typeof (returned as PromiseLike<unknown>).then === "function") {
+        void Promise.resolve(returned).catch((error: unknown) => {
+          this.logger.warn("pre-flight onVerdict observer rejected; verdict is unchanged", {
+            guard: this.config.guard,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+    } catch (error) {
+      this.logger.warn("pre-flight onVerdict observer threw; verdict is unchanged", {
+        guard: this.config.guard,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /** Race coalesced work against the waiting caller's own signal/timeout. */
@@ -1122,6 +1277,7 @@ export class PreFlightInterceptor {
       this.storeCacheEntry(context.key, {
         decision,
         ledger: context.ledger,
+        storedAt: this.clock.now(),
         expiresAt: context.expiresAt,
       });
       this.logger.debug("pre-flight verdict cached", {

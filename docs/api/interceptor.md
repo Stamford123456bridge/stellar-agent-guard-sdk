@@ -26,6 +26,7 @@ constructor(options: PreFlightInterceptorOptions)
 | `cache` | `PreFlightCacheOptions` | none — no cache; every `check()` simulates fresh | ⚠️ Opt-in. A cached verdict can be staler than one admitted transfer, so a hit can report `admissible` for a call the next simulation would block. See the cache table below. |
 | `coalesceInFlight` | `boolean` | `true` | Concurrent identical `check()` calls share one in-flight run; the shared run keeps `DEFAULT_RPC_TIMEOUT_MS` (30 000 ms) and each waiter still applies its own `signal`/`timeoutMs`. The entry is dropped as soon as the run settles (it is not a cache). Checks that pass `onStep` are never coalesced. `false`: every call runs its own simulation (more RPC load, same verdicts). |
 | `logger` | `GuardLoggerInput` | none — silent (`SILENT_LOGGER`) | Log sink for verdicts and cache hits/stores/invalidations. A logger never changes a verdict. |
+| `onVerdict` | `(event: PreFlightVerdictEvent) => void` | none | **Observability only.** Invoked exactly once per verdict `check()` returns — admissible, blocked, undetermined, cache hit, coalesced or fail-closed timeout — after the decision is final. The event carries `kind`, `reason` (blocked only), `cached`, `durationMs`, `ledger` (when known) and `call` (`{ fn, contract }`, never arguments). A hook that throws, or rejects asynchronously, is caught and logged; the verdict and fee data are unchanged. Not invoked when input validation throws, because no verdict was produced. |
 | `clock` | `Clock` | `systemClock` | Time source for cache TTL expiry. ⚠️ A fake or skewed clock outside tests changes when cached verdicts expire. |
 
 #### `PreFlightCacheOptions` (`options.cache`)
@@ -46,6 +47,7 @@ Present only when you opt in. Entries are also discarded whenever the observed l
 | `onStep` | `(step: InvokeStepEvent) => void` | none | One event per enforcement-stage attempt (probe → sign → simulate). Supplying it opts this check out of coalescing. |
 | `signal` | `AbortSignal` | none | ⚠️ Caller cancellation. An already-aborted signal returns before any RPC; a fired signal returns the fail-closed `undetermined` verdict carrying `RpcTimeoutError`, never a throw and never `admissible`. |
 | `timeoutMs` | `number` | `DEFAULT_RPC_TIMEOUT_MS` (30 000 ms) per RPC call | ⚠️ A fired timeout returns the same fail-closed `undetermined` verdict as an abort. `0` disables the per-call timeout: with no `signal`, a stalled RPC can then hold the check open. |
+| `forceFresh` | `boolean` | `false` | Bypasses the verdict cache for this call: a new simulation runs, no cached verdict is reused, and no coalesced run is joined. The cache is left untouched (nothing read, nothing stored). Use it before a high-value transfer when a hit's `ageMs`/`observedLedger` is older than you accept. |
 
 #### `CheckBatchOptions` (`checkBatch()` / `assertBatchAllowed()`)
 
@@ -74,6 +76,27 @@ as use, so the eviction order is deterministic. Eviction only removes entries �
 lookups still require a current-ledger, unexpired entry — so a bounded cache
 never returns an expired or cross-ledger verdict. Omit `maxEntries` for an
 unbounded cache.
+
+#### Staleness contract
+
+A cache hit is a real verdict computed against an earlier state. It is reused
+only inside the same ledger and inside its TTL, but inside that window it can be
+staler than the next admitted transfer — a hit may report `admissible` for a call
+a fresh simulation would block.
+
+Every hit says so on the verdict itself, in optional fields that are **absent on
+a fresh decision** and are never part of the cache key or equality:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `cached` | `true` | The verdict was served from the cache. Absent on a fresh simulation. |
+| `observedLedger` | `number` | The ledger the cached verdict was computed against. |
+| `ageMs` | `number` | Time elapsed since the verdict was stored, in milliseconds. Each hit reports its own age; earlier hits are not rewritten. |
+
+An agent loop can therefore decide per call: accept `ageMs` under its own
+threshold, or pass `forceFresh: true` before a high-value transfer. Existing
+consumers see exactly the fresh-decision shape they saw before the fields
+existed.
 
 ## Methods
 
